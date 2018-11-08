@@ -74,18 +74,19 @@ type Conn struct {
 	sessionTimeoutMs int32 // session timeout in milliseconds
 	passwd           []byte
 
-	dialer         Dialer
-	hostProvider   HostProvider
-	serverMu       sync.Mutex // protects server
-	server         string     // remember the address/port of the current server
-	conn           net.Conn
-	eventChan      chan Event
-	eventCallback  EventCallback // may be nil
-	shouldQuit     chan struct{}
-	pingInterval   time.Duration
-	recvTimeout    time.Duration
-	connectTimeout time.Duration
-	maxBufferSize  int
+	dialer          Dialer
+	hostProvider    HostProvider
+	serverMu        sync.Mutex // protects server
+	server          string     // remember the address/port of the current server
+	conn            net.Conn
+	eventChan       chan Event
+	eventCallback   EventCallback // may be nil
+	shouldQuit      chan struct{}
+	pingInterval    time.Duration
+	recvTimeout     time.Duration
+	connectTimeout  time.Duration
+	maxBufferSize   int
+	shouldReconnect bool
 
 	creds   []authCreds
 	credsMu sync.Mutex // protects server
@@ -192,20 +193,21 @@ func Connect(servers []string, sessionTimeout time.Duration, options ...connOpti
 
 	ec := make(chan Event, eventChanSize)
 	conn := &Conn{
-		dialer:         net.DialTimeout,
-		hostProvider:   &DNSHostProvider{},
-		conn:           nil,
-		state:          StateDisconnected,
-		eventChan:      ec,
-		shouldQuit:     make(chan struct{}),
-		connectTimeout: 1 * time.Second,
-		sendChan:       make(chan *request, sendChanSize),
-		requests:       make(map[int32]*request),
-		watchers:       make(map[watchPathType][]chan Event),
-		passwd:         emptyPassword,
-		logger:         DefaultLogger,
-		logInfo:        true, // default is true for backwards compatability
-		buf:            make([]byte, bufferSize),
+		dialer:          net.DialTimeout,
+		hostProvider:    &DNSHostProvider{},
+		conn:            nil,
+		state:           StateDisconnected,
+		eventChan:       ec,
+		shouldQuit:      make(chan struct{}),
+		shouldReconnect: true,
+		connectTimeout:  1 * time.Second,
+		sendChan:        make(chan *request, sendChanSize),
+		requests:        make(map[int32]*request),
+		watchers:        make(map[watchPathType][]chan Event),
+		passwd:          emptyPassword,
+		logger:          DefaultLogger,
+		logInfo:         true, // default is true for backwards compatability
+		buf:             make([]byte, bufferSize),
 	}
 
 	// Set provided options.
@@ -226,6 +228,12 @@ func Connect(servers []string, sessionTimeout time.Duration, options ...connOpti
 		close(conn.eventChan)
 	}()
 	return conn, ec, nil
+}
+
+func WithReconnect(reconnect bool) connOption {
+	return func(c *Conn) {
+		c.shouldReconnect = reconnect
+	}
 }
 
 // WithDialer returns a connection option specifying a non-default Dialer.
@@ -551,6 +559,10 @@ func (c *Conn) loop() {
 			err = ErrConnectionClosed
 		}
 		c.flushRequests(err)
+
+		if !c.shouldReconnect {
+			return
+		}
 
 		if c.reconnectLatch != nil {
 			select {
