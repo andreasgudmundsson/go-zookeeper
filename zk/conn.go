@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -73,6 +74,7 @@ type Conn struct {
 	xid              uint32
 	sessionTimeoutMs int32 // session timeout in milliseconds
 	passwd           []byte
+	chroot           string
 
 	dialer         Dialer
 	hostProvider   HostProvider
@@ -203,6 +205,7 @@ func Connect(servers []string, sessionTimeout time.Duration, options ...connOpti
 		requests:       make(map[int32]*request),
 		watchers:       make(map[watchPathType][]chan Event),
 		passwd:         emptyPassword,
+		chroot:         "",
 		logger:         DefaultLogger,
 		logInfo:        true, // default is true for backwards compatability
 		buf:            make([]byte, bufferSize),
@@ -751,6 +754,19 @@ func (c *Conn) sendData(req *request) error {
 		return nil
 	}
 
+	if req != nil && req.pkt != nil && c.chroot != "" {
+		v := reflect.ValueOf(req.pkt)
+		for v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface {
+			v = v.Elem()
+		}
+		if v.Kind() == reflect.Struct {
+			field := v.FieldByName("Path")
+			if field.Kind() == reflect.String {
+				field.SetString(c.chroot + field.String())
+			}
+		}
+	}
+
 	n2, err := encodePacket(c.buf[4+n:], req.pkt)
 	if err != nil {
 		req.recvChan <- response{-1, err}
@@ -855,6 +871,9 @@ func (c *Conn) recvLoop(conn net.Conn) error {
 			if err != nil {
 				return err
 			}
+			if c.chroot != "" {
+				res.Path = strings.TrimPrefix(res.Path, c.chroot)
+			}
 			ev := Event{
 				Type:  res.Type,
 				State: res.State,
@@ -907,6 +926,19 @@ func (c *Conn) recvLoop(conn net.Conn) error {
 				} else {
 					_, err = decodePacket(buf[16:blen], req.recvStruct)
 				}
+
+				if req != nil && req.recvStruct != nil && c.chroot != "" {
+					v := reflect.ValueOf(req.recvStruct)
+					for v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface {
+						v = v.Elem()
+					}
+					if v.Kind() == reflect.Struct {
+						field := v.FieldByName("Path")
+						if field.Kind() == reflect.String {
+							field.SetString(strings.TrimPrefix(field.String(), c.chroot))
+						}
+					}
+				}
 				if req.recvFunc != nil {
 					req.recvFunc(req, &res, err)
 				}
@@ -949,6 +981,16 @@ func (c *Conn) queueRequest(opcode int32, req interface{}, res interface{}, recv
 func (c *Conn) request(opcode int32, req interface{}, res interface{}, recvFunc func(*request, *responseHeader, error)) (int64, error) {
 	r := <-c.queueRequest(opcode, req, res, recvFunc)
 	return r.zxid, r.err
+}
+
+func (c *Conn) Chroot(path string) error {
+	res := &existsResponse{}
+	_, err := c.request(opExists, &existsRequest{Path: path, Watch: false}, res, nil)
+	if err != nil {
+		return err
+	}
+	c.chroot = path
+	return nil
 }
 
 func (c *Conn) AddAuth(scheme string, auth []byte) error {
