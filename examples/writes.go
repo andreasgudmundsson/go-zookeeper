@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"github.com/samuel/go-zookeeper/zk"
+	"github.com/andreasgudmundsson/go-zookeeper/zk"
 	"math/rand"
 	"os"
 	"time"
