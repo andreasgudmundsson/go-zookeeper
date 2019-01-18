@@ -2,21 +2,30 @@ package main
 
 import (
 	"fmt"
-	"time"
-
 	"github.com/samuel/go-zookeeper/zk"
+	"os"
+	"time"
 )
 
 func main() {
-	c, _, err := zk.Connect([]string{"127.0.0.1"}, time.Second) //*10)
+	conn_s := "127.0.0.1"
+	if len(os.Args) >= 2 {
+		conn_s = os.Args[1]
+	}
+	servers, chroot := zk.ParseConnectionString(conn_s)
+	fmt.Printf("%+v, chroot=%s\n", servers, chroot)
+	c, _, err := zk.Connect(servers, time.Second, zk.WithChroot(chroot))
 	if err != nil {
 		panic(err)
 	}
-	children, stat, ch, err := c.ChildrenW("/")
+	children, _, ch, err := c.ChildrenW("/")
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("%+v %+v\n", children, stat)
-	e := <-ch
-	fmt.Printf("%+v\n", e)
+	for _, c := range children {
+		fmt.Printf("%v\n", c)
+	}
+	for e := range ch {
+		fmt.Printf("%v\n", e)
+	}
 }

@@ -168,6 +168,16 @@ func ConnectWithDialer(servers []string, sessionTimeout time.Duration, dialer Di
 	return Connect(servers, sessionTimeout, WithDialer(dialer))
 }
 
+func ParseConnectionString(s string) (servers []string, chroot string) {
+	slashIdx := strings.IndexRune(s, '/')
+	if slashIdx != -1 {
+		chroot = s[slashIdx:]
+		s = s[0:slashIdx]
+	}
+	servers = strings.Split(s, ",")
+	return servers, chroot
+}
+
 // Connect establishes a new connection to a pool of zookeeper
 // servers. The provided session timeout sets the amount of time for which
 // a session is considered valid after losing connection to a server. Within
@@ -228,7 +238,30 @@ func Connect(servers []string, sessionTimeout time.Duration, options ...connOpti
 		conn.invalidateWatches(ErrClosing)
 		close(conn.eventChan)
 	}()
+
+	if conn.chroot != "" {
+		if err := validatePath(conn.chroot, false); err != nil {
+			conn.Close()
+			return nil, nil, fmt.Errorf("Error setting chroot '%s': %s", conn.chroot, err)
+		}
+
+		exists, _, err := conn.Exists("/")
+		if err != nil {
+			conn.Close()
+			return nil, nil, err
+		}
+		if !exists {
+			conn.Close()
+			return nil, nil, fmt.Errorf("Error setting chroot '%s': %s", conn.chroot, ErrNoNode)
+		}
+	}
 	return conn, ec, nil
+}
+
+func WithChroot(chroot string) connOption {
+	return func(c *Conn) {
+		c.chroot = chroot
+	}
 }
 
 // WithDialer returns a connection option specifying a non-default Dialer.
@@ -746,6 +779,42 @@ func (c *Conn) authenticate() error {
 	return nil
 }
 
+func chrootRequest(pkt interface{}, chroot string) {
+	v := reflect.ValueOf(pkt)
+	for v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface {
+		v = v.Elem()
+	}
+	if v.Kind() == reflect.Struct {
+		field := v.FieldByName("Path")
+		if field.Kind() == reflect.String {
+			rebased := chroot
+			local := field.String()
+			if local != "/" {
+				rebased = chroot + local
+			}
+			field.SetString(rebased)
+		}
+	}
+}
+
+func chrootResponse(pkt interface{}, chroot string) {
+	v := reflect.ValueOf(pkt)
+	for v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface {
+		v = v.Elem()
+	}
+	if v.Kind() == reflect.Struct {
+		field := v.FieldByName("Path")
+		if field.Kind() == reflect.String {
+			rebased := "/"
+			remote := field.String()
+			if chroot != remote {
+				rebased = strings.TrimPrefix(field.String(), chroot)
+			}
+			field.SetString(rebased)
+		}
+	}
+}
+
 func (c *Conn) sendData(req *request) error {
 	header := &requestHeader{req.xid, req.opcode}
 	n, err := encodePacket(c.buf[4:], header)
@@ -755,16 +824,7 @@ func (c *Conn) sendData(req *request) error {
 	}
 
 	if req != nil && req.pkt != nil && c.chroot != "" {
-		v := reflect.ValueOf(req.pkt)
-		for v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface {
-			v = v.Elem()
-		}
-		if v.Kind() == reflect.Struct {
-			field := v.FieldByName("Path")
-			if field.Kind() == reflect.String {
-				field.SetString(c.chroot + field.String())
-			}
-		}
+		chrootRequest(req.pkt, c.chroot)
 	}
 
 	n2, err := encodePacket(c.buf[4+n:], req.pkt)
@@ -872,7 +932,11 @@ func (c *Conn) recvLoop(conn net.Conn) error {
 				return err
 			}
 			if c.chroot != "" {
-				res.Path = strings.TrimPrefix(res.Path, c.chroot)
+				if c.chroot == res.Path {
+					res.Path = "/"
+				} else {
+					res.Path = strings.TrimPrefix(res.Path, c.chroot)
+				}
 			}
 			ev := Event{
 				Type:  res.Type,
@@ -928,16 +992,7 @@ func (c *Conn) recvLoop(conn net.Conn) error {
 				}
 
 				if req != nil && req.recvStruct != nil && c.chroot != "" {
-					v := reflect.ValueOf(req.recvStruct)
-					for v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface {
-						v = v.Elem()
-					}
-					if v.Kind() == reflect.Struct {
-						field := v.FieldByName("Path")
-						if field.Kind() == reflect.String {
-							field.SetString(strings.TrimPrefix(field.String(), c.chroot))
-						}
-					}
+					chrootResponse(req.recvStruct, c.chroot)
 				}
 				if req.recvFunc != nil {
 					req.recvFunc(req, &res, err)
@@ -981,16 +1036,6 @@ func (c *Conn) queueRequest(opcode int32, req interface{}, res interface{}, recv
 func (c *Conn) request(opcode int32, req interface{}, res interface{}, recvFunc func(*request, *responseHeader, error)) (int64, error) {
 	r := <-c.queueRequest(opcode, req, res, recvFunc)
 	return r.zxid, r.err
-}
-
-func (c *Conn) Chroot(path string) error {
-	res := &existsResponse{}
-	_, err := c.request(opExists, &existsRequest{Path: path, Watch: false}, res, nil)
-	if err != nil {
-		return err
-	}
-	c.chroot = path
-	return nil
 }
 
 func (c *Conn) AddAuth(scheme string, auth []byte) error {
