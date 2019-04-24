@@ -780,19 +780,27 @@ func (c *Conn) authenticate() error {
 }
 
 func chrootRequest(pkt interface{}, chroot string) {
-	v := reflect.ValueOf(pkt)
-	for v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface {
-		v = v.Elem()
-	}
-	if v.Kind() == reflect.Struct {
-		field := v.FieldByName("Path")
-		if field.Kind() == reflect.String {
-			rebased := chroot
-			local := field.String()
-			if local != "/" {
-				rebased = chroot + local
+	switch req := pkt.(type) {
+	case *multiRequest:
+		for _, op := range req.Ops {
+			chrootRequest(op.Op, chroot)
+		}
+	default:
+		v := reflect.ValueOf(pkt)
+		for v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface {
+			v = v.Elem()
+		}
+		if v.Kind() == reflect.Struct {
+			field := v.FieldByName("Path")
+
+			if field.Kind() == reflect.String {
+				rebased := chroot
+				local := field.String()
+				if local != "/" {
+					rebased = chroot + local
+				}
+				field.SetString(rebased)
 			}
-			field.SetString(rebased)
 		}
 	}
 }
